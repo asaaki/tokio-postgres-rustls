@@ -9,7 +9,7 @@ use std::{
 
 use futures::future::{FutureExt, TryFutureExt};
 use ring::digest;
-use rustls::{ClientConfig, ServerName};
+use rustls::{ClientConfig, pki_types::ServerName};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_postgres::tls::{ChannelBinding, MakeTlsConnect, TlsConnect};
 use tokio_rustls::{client::TlsStream, TlsConnector};
@@ -39,7 +39,7 @@ where
         ServerName::try_from(hostname)
             .map(|dns_name| {
                 RustlsConnect(Some(RustlsConnectData {
-                    hostname: dns_name,
+                    hostname: dns_name.to_owned(),
                     connector: Arc::clone(&self.config).into(),
                 }))
             })
@@ -50,7 +50,7 @@ where
 pub struct RustlsConnect(Option<RustlsConnectData>);
 
 struct RustlsConnectData {
-    hostname: ServerName,
+    hostname: ServerName<'static>,
     connector: TlsConnector,
 }
 
@@ -130,21 +130,58 @@ where
 mod tests {
     use super::*;
     use futures::future::TryFutureExt;
-    use rustls::{client::ServerCertVerified, client::ServerCertVerifier, Certificate, Error};
-    use std::time::SystemTime;
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::client::danger::HandshakeSignatureValid;
+    use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
+    use rustls::DigitallySignedStruct;
 
-    struct AcceptAllVerifier {}
-    impl ServerCertVerifier for AcceptAllVerifier {
+    #[derive(Debug)]
+    pub struct NoCertificateVerification {}
+
+    impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
         fn verify_server_cert(
             &self,
-            _end_entity: &Certificate,
-            _intermediates: &[Certificate],
-            _server_name: &ServerName,
-            _scts: &mut dyn Iterator<Item = &[u8]>,
-            _ocsp_response: &[u8],
-            _now: SystemTime,
-        ) -> Result<ServerCertVerified, Error> {
-            Ok(ServerCertVerified::assertion())
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp: &[u8],
+            _now: UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
         }
     }
 
@@ -153,15 +190,14 @@ mod tests {
         env_logger::builder().is_test(true).try_init().unwrap();
 
         let mut config = rustls::ClientConfig::builder()
-            .with_safe_defaults()
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_no_client_auth();
         config
             .dangerous()
-            .set_certificate_verifier(Arc::new(AcceptAllVerifier {}));
+            .set_certificate_verifier(Arc::new(NoCertificateVerification {}));
         let tls = super::MakeRustlsConnect::new(config);
         let (client, conn) = tokio_postgres::connect(
-            "sslmode=require host=localhost port=5432 user=postgres",
+            "sslmode=require host=localhost port=5432 user=postgres password=postgres",
             tls,
         )
         .await
